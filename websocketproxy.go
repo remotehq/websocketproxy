@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 
 	"github.com/gorilla/websocket"
 )
@@ -62,6 +63,25 @@ type ProxyConfig struct {
 // ProxyHandler returns a new http.Handler interface that reverse proxies the
 // request to the given target.
 func ProxyHandler(target *url.URL, config *ProxyConfig) http.Handler { return NewProxy(target, config) }
+
+// proxyConn wraps a websocket.Conn to ensure mutual exclusions on writes. this is necessary because we have
+// ping/pong messaging which happens on a separate thread via FE
+type proxyConn struct {
+	conn *websocket.Conn
+
+	mutex sync.Mutex
+}
+
+func (pc *proxyConn) send(msgType int, data []byte) error {
+	pc.mutex.Lock()
+	defer pc.mutex.Unlock()
+
+	return pc.conn.WriteMessage(msgType, data)
+}
+
+func (pc *proxyConn) receive() (messageType int, p []byte, err error) {
+	return pc.conn.ReadMessage()
+}
 
 // NewProxy returns a new Websocket reverse proxy that rewrites the
 // URL's to the scheme, host and base path provider in target.
@@ -196,9 +216,9 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 
 	errClient := make(chan error, 1)
 	errBackend := make(chan error, 1)
-	replicateWebsocketConn := func(dst, src *websocket.Conn, errc chan error, supportPingPong bool) {
+	replicateWebsocketConn := func(dst, src *proxyConn, errc chan error, supportPingPong bool) {
 		for {
-			msgType, msg, err := src.ReadMessage()
+			msgType, msg, err := src.receive()
 			if err != nil {
 				m := websocket.FormatCloseMessage(websocket.CloseNormalClosure, fmt.Sprintf("%v", err))
 				if e, ok := err.(*websocket.CloseError); ok {
@@ -207,13 +227,13 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 					}
 				}
 				errc <- err
-				dst.WriteMessage(websocket.CloseMessage, m)
+				dst.send(websocket.CloseMessage, m)
 				break
 			}
 			if supportPingPong && bytes.Equal(msg, pingMessage) {
-				src.WriteMessage(msgType, pongMessage)
+				src.send(msgType, pongMessage)
 			} else {
-				err = dst.WriteMessage(msgType, msg)
+				err = dst.send(msgType, msg)
 				if err != nil {
 					errc <- err
 					break
@@ -222,8 +242,11 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		}
 	}
 
-	go replicateWebsocketConn(connPub, connBackend, errClient, false)
-	go replicateWebsocketConn(connBackend, connPub, errBackend, w.config.SupportClientPingPong)
+	pcConnPub := &proxyConn{conn: connPub}
+	pcConnBackend := &proxyConn{conn: connBackend}
+
+	go replicateWebsocketConn(pcConnPub, pcConnBackend, errClient, false)
+	go replicateWebsocketConn(pcConnBackend, pcConnPub, errBackend, w.config.SupportClientPingPong)
 
 	var message string
 	select {
